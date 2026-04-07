@@ -3,6 +3,7 @@
 
 # Python cache files
 __pycache__/
+*.pyc
 
 # uv project files (Streamlit Cloud uses requirements.txt instead)
 .python-version
