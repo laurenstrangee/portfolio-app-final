@@ -23,16 +23,20 @@ ALL_TICKERS = STOCKS + [BENCHMARK]
 # ------------------------------
 @st.cache_data(ttl=3600)
 def download_data(tickers, start, end):
+    failed = []
     try:
         data = yf.download(tickers, start=start, end=end)['Adj Close']
+        # If single ticker, turn into DataFrame
         if isinstance(data, pd.Series):
             data = data.to_frame()
+        # Drop columns with >5% missing
         missing = data.isna().mean()
         for col in missing[missing > 0.05].index:
+            failed.append(col)
             data = data.drop(columns=col)
         if data.empty:
-            return pd.DataFrame(), tickers
-        return data, []
+            failed = tickers
+        return data, failed
     except Exception as e:
         return pd.DataFrame(), tickers
 
