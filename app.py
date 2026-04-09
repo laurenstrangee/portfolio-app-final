@@ -22,8 +22,12 @@ st.title("Stock Analysis Dashboard")
 # -- Sidebar: user inputs --------------------------------
 st.sidebar.header("Settings")
 
-ticker = st.sidebar.text_input("Stock Ticker", value="AAPL").upper().strip()
+tickers_input = st.sidebar.text_input(
+    "Stock Tickers (3-10, comma separated)",
+    value="AAPL,MSFT,AMZN,PG,JNJ,JPM"
+)
 
+tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 # Default date range: one year back from today
 default_start = date.today() - timedelta(days=365)
 start_date = st.sidebar.date_input("Start Date", value=default_start, min_value=date(1970, 1, 1))
@@ -51,190 +55,112 @@ vol_window = st.sidebar.slider(
 # the same inputs don't re-download every time. The ttl (time-to-live)
 # ensures the cache expires after one hour so data stays fresh.
 @st.cache_data(show_spinner="Fetching data...", ttl=3600)
-def load_data(ticker: str, start: date, end: date) -> pd.DataFrame:
-    """Download daily data from Yahoo Finance for a given date range."""
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    return df
+def load_data(tickers, start: date, end: date) -> pd.DataFrame:
+    df = yf.download(tickers + ["^GSPC"], start=start, end=end, progress=False)
+    return df["Adj Close"]
 
 # -- Main logic -------------------------------------------
-if ticker:
-    try:
-        df = load_data(ticker, start_date, end_date)
-    except Exception as e:
-        st.error(f"Failed to download data: {e}")
-        st.stop()
+if len(tickers) < 3 or len(tickers) > 10:
+    st.error("Please enter between 3 and 10 tickers.")
+    st.stop()
 
-    if df.empty:
-        st.error(
-            f"No data found for **{ticker}**. "
-            "Check the ticker symbol and try again."
-        )
-        st.stop()
+if (end_date - start_date).days < 365*2:
+    st.error("Date range must be at least 2 years.")
+    st.stop()
 
-    # Flatten any multi-level columns that yfinance sometimes returns
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+try:
+    data = load_data(tickers, start_date, end_date)
+except Exception as e:
+    st.error(f"Download failed: {e}")
+    st.stop()
 
-    # -- Compute a derived column -------------------------
-    df["Daily Return"] = df["Close"].pct_change()
-    df[f"{ma_window}-Day MA"] = df["Close"].rolling(window=ma_window).mean()
-    df["Cumulative Return"] = (1 + df["Daily Return"]).cumprod() - 1
-    df["Rolling Volatility"] = df["Daily Return"].rolling(window=vol_window).std() * math.sqrt(252)
-    if ma_window > len(df):
-        st.warning(
-            f"The selected {ma_window}-day window is longer than the "
-            f"available data ({len(df)} trading days). The moving average "
-            "line won't appear — try a shorter window or a wider date range."
-        )
+if data.empty:
+    st.error("No data found.")
+    st.stop()
 
-    # -- Key metrics --------------------------------------
-    latest_close = float(df["Close"].iloc[-1])
-    total_return = float(df["Cumulative Return"].iloc[-1])
-    avg_daily_ret = float(df["Daily Return"].mean())
-    volatility = float(df["Daily Return"].std())
-    ann_volatility = volatility * math.sqrt(252)
-    ann_return = avg_daily_ret * 252
-    sharpe = (ann_return - risk_free_rate) / ann_volatility
-    skewness = float(df["Daily Return"].skew())
-    kurtosis = float(df["Daily Return"].kurtosis())
-    max_close = float(df["Close"].max())
-    min_close = float(df["Close"].min())
+# Handle missing data
+data = data.dropna()
 
-    st.subheader(f"{ticker} — Key Metrics")
+returns = data.pct_change().dropna()
+asset_returns = returns.drop(columns="^GSPC")
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Latest Close", f"${latest_close:,.2f}")
-    col2.metric("Total Return", f"{total_return:.2%}")
-    col3.metric("Annualized Return", f"{ann_return:.2%}")
-    col4.metric("Sharpe Ratio", f"{sharpe:.2f}")
+mean = asset_returns.mean() * 252
+cov = asset_returns.cov() * 252
 
-    col5, col6, col7, col8 = st.columns(4)
-    col5.metric("Annualized Volatility (sigma)", f"{ann_volatility:.2%}")
-    col6.metric("Skewness", f"{skewness:.2f}")
-    col7.metric("Excess Kurtosis", f"{kurtosis:.2f}")
-    col8.metric("Avg Daily Return", f"{avg_daily_ret:.4%}")
+def portfolio_stats(w):
+    port_ret = np.dot(w, mean)
+    port_vol = np.sqrt(w.T @ cov @ w)
 
-    col9, col10, _, _ = st.columns(4)
-    col9.metric("Period High", f"${max_close:,.2f}")
-    col10.metric("Period Low", f"${min_close:,.2f}")
+    sharpe = (port_ret - risk_free_rate) / port_vol
 
-    st.divider()
+    port_returns = asset_returns @ w
 
-    # -- Price chart --------------------------------------
-    st.subheader("Price & Moving Average")
+    downside = port_returns[port_returns < risk_free_rate/252]
+    downside_std = downside.std() * np.sqrt(252)
 
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df.index, y=df["Close"],
-            mode="lines", name="Close Price",
-            line=dict(width=1.5)
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df.index, y=df[f"{ma_window}-Day MA"],
-            mode="lines", name=f"{ma_window}-Day MA",
-            line=dict(width=2, dash="dash")
-        )
-    )
-    fig.update_layout(
-        yaxis_title="Price (USD)", xaxis_title="Date",
-        template="plotly_white", height=450
-    )
-    st.plotly_chart(fig, width="stretch")
+    sortino = (port_ret - risk_free_rate) / downside_std if downside_std != 0 else np.nan
 
-    # -- Volume chart -------------------------------------
-    st.subheader("Daily Trading Volume")
+    wealth = (1 + port_returns).cumprod()
+    peak = wealth.cummax()
+    dd = (wealth - peak) / peak
+    max_dd = dd.min()
 
-    fig_vol = go.Figure()
-    fig_vol.add_trace(
-        go.Bar(x=df.index, y=df["Volume"], name="Volume",
-               marker_color="steelblue", opacity=0.7)
-    )
-    fig_vol.update_layout(
-        yaxis_title="Shares Traded", xaxis_title="Date",
-        template="plotly_white", height=350
-    )
-    st.plotly_chart(fig_vol, width="stretch")
+    return port_ret, port_vol, sharpe, sortino, max_dd
+st.header("Portfolio Analysis")
 
-    # -- Daily returns distribution -----------------------
-    # -- Daily returns distribution -----------------------
-    st.subheader("Distribution of Daily Returns")
+n = len(tickers)
+w_eq = np.ones(n) / n  # YOUR ORIGINAL PROJECT
 
-    returns_clean = df["Daily Return"].dropna()
+# Portfolio returns
+port_returns = asset_returns @ w_eq
 
-    fig_hist = go.Figure()
-    fig_hist.add_trace(
-        go.Histogram(
-            x=returns_clean, nbinsx=60,
-            marker_color="mediumpurple", opacity=0.75,
-            name="Daily Returns", histnorm="probability density"
-        )
-    )
+# Metrics
+stats_eq = portfolio_stats(w_eq)
 
-    # Overlay a fitted normal distribution curve
-    x_range = np.linspace(float(returns_clean.min()), float(returns_clean.max()), 200)
-    mu = float(returns_clean.mean())
-    sigma = float(returns_clean.std())
-    fig_hist.add_trace(
-        go.Scatter(
-            x=x_range, y=stats.norm.pdf(x_range, mu, sigma),
-            mode="lines", name="Normal Distribution",
-            line=dict(color="red", width=2)
-        )
-    )
+st.subheader("My Portfolio (Equal Weight from Project 1)")
 
-    fig_hist.update_layout(
-        xaxis_title="Daily Return", yaxis_title="Density",
-        template="plotly_white", height=350
-    )
-    st.plotly_chart(fig_hist, width="stretch")
+col1, col2, col3 = st.columns(3)
+col1.metric("Return", f"{stats_eq[0]:.2%}")
+col2.metric("Volatility", f"{stats_eq[1]:.2%}")
+col3.metric("Sharpe", f"{stats_eq[2]:.2f}")
 
-    # Display normality test results
-    jb_stat, jb_pvalue = stats.jarque_bera(returns_clean)
-    st.caption(
-        f"**Jarque-Bera test:** statistic = {jb_stat:.2f}, p-value = {jb_pvalue:.4f} — "
-        f"{'Fail to reject normality (p > 0.05)' if jb_pvalue > 0.05 else 'Reject normality (p <= 0.05)'}"
-    )
+col4, col5 = st.columns(2)
+col4.metric("Sortino", f"{stats_eq[3]:.2f}")
+col5.metric("Max Drawdown", f"{stats_eq[4]:.2%}")
 
-    # -- Cumulative return chart --------------------------
-    st.subheader("Cumulative Return Over Time")
+# Wealth chart
+wealth = (1 + port_returns).cumprod()
 
-    fig_cum = go.Figure()
-    fig_cum.add_trace(
-        go.Scatter(
-            x=df.index, y=df["Cumulative Return"],
-            mode="lines", name="Cumulative Return",
-            fill="tozeroy", line=dict(color="teal")
-        )
-    )
-    fig_cum.update_layout(
-        yaxis_title="Cumulative Return", yaxis_tickformat=".0%",
-        xaxis_title="Date", template="plotly_white", height=400
-    )
-    st.plotly_chart(fig_cum, width="stretch")
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=wealth.index, y=wealth, name="My Portfolio"))
+st.plotly_chart(fig, width="stretch")
 
-    # -- Rolling volatility chart -------------------------
-    st.subheader("Rolling Annualized Volatility")
+st.write("""
+This portfolio replicates my original project:
+- Equal weight across AAPL, MSFT, AMZN, PG, JNJ, JPM
+- Provides diversification across sectors
+- Serves as baseline vs optimized portfolios
+""")
+st.header("Correlation Matrix")
 
-    fig_roll_vol = go.Figure()
-    fig_roll_vol.add_trace(
-        go.Scatter(
-            x=df.index, y=df["Rolling Volatility"],
-            mode="lines", name=f"{vol_window}-Day Rolling Vol",
-            line=dict(color="crimson", width=1.5)
-        )
-    )
-    fig_roll_vol.update_layout(
-        yaxis_title="Annualized Volatility", yaxis_tickformat=".0%",
-        xaxis_title="Date", template="plotly_white", height=400
-    )
-    st.plotly_chart(fig_roll_vol, width="stretch")
+corr = asset_returns.corr()
 
-    # -- Raw data (expandable) ----------------------------
-    with st.expander("View Raw Data"):
-        st.dataframe(df.tail(60), width="stretch")
+fig = go.Figure(data=go.Heatmap(
+    z=corr.values,
+    x=corr.columns,
+    y=corr.columns,
+    text=np.round(corr.values, 2),
+    texttemplate="%{text}",
+    colorscale="RdBu"
+))
 
-else:
-    st.info("Enter a stock ticker in the sidebar to get started.")
+st.plotly_chart(fig, width="stretch")
+
+st.sidebar.subheader("About")
+
+st.sidebar.write("""
+- Uses simple returns
+- 252 trading day annualization
+- Mean-variance framework
+- Data from Yahoo Finance
+""")
