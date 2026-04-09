@@ -159,14 +159,24 @@ with tabs[0]:
         prices, failed = download_data(tickers, start_date, end_date)
     if failed:
         st.error(f"Failed tickers or insufficient data: {', '.join(failed)}")
+
+    if prices.empty:
+        st.warning("No valid tickers available. Please check your inputs.")
+        st.stop()  # Stop execution if no valid data
+
     st.dataframe(prices.tail())
 
 # ------------------------------
 # Tab 2: Stock Analysis
 # ------------------------------
 with tabs[1]:
-    st.header("Stock-level Analysis")
     returns = compute_returns(prices)
+
+    if returns.empty:
+        st.warning("No return data available. Cannot perform analysis.")
+        st.stop()
+
+    st.header("Stock-level Analysis")
     st.subheader("Annualized Summary Statistics")
     st.dataframe(annualized_stats(returns).style.format("{:.4f}"))
 
@@ -181,15 +191,18 @@ with tabs[1]:
 # Tab 3: Portfolio Optimization
 # ------------------------------
 with tabs[2]:
-    st.header("Portfolio Optimization")
     mean_ret = returns.mean()
     cov_mat = returns.cov()
     n = len(mean_ret)
-    
+
+    if n == 0:
+        st.warning("No valid returns to construct portfolios.")
+        st.stop()  # Stop execution to avoid ZeroDivisionError
+
     eq_w = np.array([1/n]*n)
     gmv_w = optimize_portfolio(mean_ret, cov_mat, rf_rate, method='min_vol')
     tan_w = optimize_portfolio(mean_ret, cov_mat, rf_rate, method='sharpe')
-    
+
     # Custom portfolio sliders
     st.subheader("Custom Portfolio")
     custom_weights = []
@@ -197,7 +210,7 @@ with tabs[2]:
         w = st.slider(f"{t} Weight", 0.0, 1.0, 1/n, 0.01)
         custom_weights.append(w)
     custom_weights = np.array(custom_weights)/sum(custom_weights)
-    
+
     # Portfolio metrics
     portfolios = {"Equal Weight": eq_w, "GMV": gmv_w, "Tangency": tan_w, "Custom": custom_weights}
     metrics = {}
@@ -205,7 +218,7 @@ with tabs[2]:
         r,v,s,so,_ = portfolio_metrics(w, mean_ret, cov_mat, rf_rate)
         metrics[name] = [r,v,s,so]
     st.dataframe(pd.DataFrame(metrics, index=["Return","Volatility","Sharpe","Sortino"]).T.round(4))
-    
+
     # Efficient Frontier
     ef_vol, ef_ret, ef_w = efficient_frontier(mean_ret, cov_mat)
     fig = go.Figure()
@@ -218,7 +231,7 @@ with tabs[2]:
     fig.add_trace(go.Scatter(x=cal_x, y=cal_y, mode='lines', name="Capital Allocation Line", line=dict(dash='dash')))
     fig.update_layout(title="Efficient Frontier & CAL", xaxis_title="Volatility", yaxis_title="Expected Return")
     st.plotly_chart(fig, use_container_width=True)
-    
+
     # Risk Contribution for GMV & Tangency
     st.subheader("Risk Contribution")
     for name,w in [("GMV", gmv_w), ("Tangency", tan_w)]:
